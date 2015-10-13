@@ -292,6 +292,16 @@ func (st *serverTester) bodylessReq1(headers ...string) {
 	})
 }
 
+// bodylessReqN writes a HEADERS frames with StreamID streamID and EndStream and EndHeaders set.
+func (st *serverTester) bodylessReq(streamID uint32, headers ...string) {
+	st.writeHeaders(HeadersFrameParam{
+		StreamID:      streamID, // clients send odd numbers
+		BlockFragment: st.encodeHeader(headers...),
+		EndStream:     true,
+		EndHeaders:    true,
+	})
+}
+
 func (st *serverTester) writeData(streamID uint32, endStream bool, data []byte) {
 	if err := st.fr.WriteData(streamID, endStream, data); err != nil {
 		st.t.Fatalf("Error writing DATA: %v", err)
@@ -1581,6 +1591,65 @@ func TestServer_Response_LargeWrite(t *testing.T) {
 		}
 		if want := int(size / maxFrameSize); frames < want || frames > want*2 {
 			t.Errorf("Got %d frames; want %d", frames, size)
+		}
+	})
+}
+
+func TestServer_Response_LargeWrite_Concurrent(t *testing.T) {
+	const size = 1 << 20
+	const maxFrameSize = 16 << 10
+	testServerResponse(t, func(w http.ResponseWriter, r *http.Request) error {
+		n, err := w.Write(bytes.Repeat([]byte("a"), size))
+		if err != nil {
+			return fmt.Errorf("Write error: %v", err)
+		}
+		if n != size {
+			return fmt.Errorf("wrong size %d from Write", n)
+		}
+		return nil
+	}, func(st *serverTester) {
+		if err := st.fr.WriteSettings(
+			Setting{SettingInitialWindowSize, 0},
+			Setting{SettingMaxFrameSize, maxFrameSize},
+		); err != nil {
+			t.Fatal(err)
+		}
+		st.wantSettingsAck()
+
+		streamID := uint32(1) // clients send odd ids
+		for i := 0; i < 10; i++ {
+			println("sending:", streamID)
+			st.bodylessReq(streamID) // GET /
+			// Give the handler quota to write:
+			if err := st.fr.WriteWindowUpdate(streamID, size); err != nil {
+				t.Fatal(err)
+			}
+			// Give the handler quota to write to connection-level
+			// window as well
+			if err := st.fr.WriteWindowUpdate(0, size); err != nil {
+				t.Fatal(err)
+			}
+			streamID += 2
+		}
+
+		endedHeaders := map[uint32]bool{} // keyed on streamID
+		for {
+			println("ReadFrame")
+			f, err := st.fr.ReadFrame()
+			if err != nil {
+				panic(err)
+			}
+			fmt.Printf("Frame: %v\n", f)
+			headersEnded := false
+			if he, ok := f.(headersEnder); ok {
+				headersEnded = he.HeadersEnded()
+			}
+			sid := f.Header().StreamID
+			endedHeaders[sid] = headersEnded
+
+			if _, ok := f.(*DataFrame); ok && !endedHeaders[sid] {
+				t.Fatalf("unexpected DATA_FRAME for unended headers: %v", f)
+			}
 		}
 	})
 }
